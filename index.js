@@ -8,6 +8,7 @@ const DATA_FILE = path.join(__dirname, "redis_data.json");
 let store = {};
 let expiryTimes = {};
 
+// Load data from file on startup, if it exists
 if (fs.existsSync(DATA_FILE)) {
   try {
     const fileData = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -19,19 +20,30 @@ if (fs.existsSync(DATA_FILE)) {
   }
 }
 
+// Function to save the current state to the JSON file
 function saveToFile() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify({ store, expiryTimes }, null, 2));
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ store, expiryTimes }, null, 2));
+  } catch (err) {
+    console.error("Error saving data to file:", err);
+  }
 }
 
+// Function to check for and remove expired keys
 function checkExpiry() {
   const now = Date.now();
+  let changed = false;
   for (const key in expiryTimes) {
     if (now > expiryTimes[key]) {
       delete store[key];
       delete expiryTimes[key];
+      changed = true;
     }
   }
-  saveToFile();
+  // Only save to file if something was actually deleted
+  if (changed) {
+    saveToFile();
+  }
 }
 
 // Run expiry check every 5 seconds
@@ -51,26 +63,35 @@ const server = net.createServer((connection) => {
             const key = reply[1];
             let value = reply[2];
 
+            // Attempt to parse JSON strings
             if (
               typeof value === "string" &&
               (value.trim().startsWith("{") || value.trim().startsWith("["))
             ) {
               try {
                 value = JSON.parse(value);
-              } catch (e) {}
+              } catch (e) {
+                // Not valid JSON, treat as string
+              }
             }
 
             store[key] = value;
-            delete expiryTimes[key];
+            delete expiryTimes[key]; // SET removes any existing expiry
             saveToFile();
             connection.write("+OK\r\n");
             break;
           }
 
+          // SETEX key seconds value
           case "setex": {
             const key = reply[1];
             const seconds = parseInt(reply[2]);
             let value = reply[3];
+
+            if (isNaN(seconds) || seconds <= 0) {
+              connection.write("-ERR invalid expire time in setex\r\n");
+              break;
+            }
 
             if (
               typeof value === "string" &&
@@ -78,7 +99,9 @@ const server = net.createServer((connection) => {
             ) {
               try {
                 value = JSON.parse(value);
-              } catch (e) {}
+              } catch (e) {
+                // Not valid JSON, treat as string
+              }
             }
 
             store[key] = value;
@@ -88,10 +111,60 @@ const server = net.createServer((connection) => {
             break;
           }
 
+          // NEW: EXPIRE key seconds
+          case "expire": {
+            const key = reply[1];
+            const seconds = parseInt(reply[2]);
+
+            if (isNaN(seconds) || seconds <= 0) {
+              connection.write("-ERR invalid expire time in expire\r\n");
+              break;
+            }
+
+            if (store[key] === undefined) {
+              connection.write(":0\r\n"); // Key does not exist
+            } else {
+              expiryTimes[key] = Date.now() + seconds * 1000;
+              saveToFile();
+              connection.write(":1\r\n"); // Expiry set
+            }
+            break;
+          }
+
+          // NEW: TTL key
+          case "ttl": {
+            const key = reply[1];
+
+            if (store[key] === undefined) {
+              connection.write(":-2\r\n"); // Key does not exist
+              break;
+            }
+
+            if (expiryTimes[key] === undefined) {
+              connection.write(":-1\r\n"); // Key exists but has no expiry
+              break;
+            }
+
+            const now = Date.now();
+            if (expiryTimes[key] < now) {
+                // Key is expired, delete it
+                delete store[key];
+                delete expiryTimes[key];
+                saveToFile();
+                connection.write(":-2\r\n"); // Key does not exist (as it was expired)
+            } else {
+                // Key exists and has expiry
+                const remainingSeconds = Math.round((expiryTimes[key] - now) / 1000);
+                connection.write(`:${remainingSeconds}\r\n`);
+            }
+            break;
+          }
+
           // GET key
           case "get": {
             const key = reply[1];
 
+            // Check for expiry on GET
             if (expiryTimes[key] && Date.now() > expiryTimes[key]) {
               delete store[key];
               delete expiryTimes[key];
@@ -100,12 +173,13 @@ const server = net.createServer((connection) => {
 
             const value = store[key];
             if (value === undefined) {
-              connection.write("$-1\r\n");
+              connection.write("$-1\r\n"); // Nil reply
             } else {
               let output;
 
+              // Stringify objects for transmission
               if (typeof value === "object") {
-                output = JSON.stringify(value, null, 2);
+                output = JSON.stringify(value); // More compact than with newlines
               } else {
                 output = String(value);
               }
@@ -118,9 +192,12 @@ const server = net.createServer((connection) => {
           // DEL key
           case "del": {
             const key = reply[1];
-            const deleted = delete store[key];
+            const deleted = store.hasOwnProperty(key); // Check if key exists before delete
+            delete store[key];
             delete expiryTimes[key];
-            saveToFile();
+            if (deleted) {
+              saveToFile();
+            }
             connection.write(`:${deleted ? 1 : 0}\r\n`);
             break;
           }
@@ -130,7 +207,10 @@ const server = net.createServer((connection) => {
             const keys = Object.keys(store);
             const response =
               `*${keys.length}\r\n` +
-              keys.map((k) => `$${k.length}\r\n${k}\r\n`).join("");
+              keys.map((k) => {
+                const byteLength = Buffer.byteLength(k, "utf8");
+                return `$${byteLength}\r\n${k}\r\n`
+              }).join("");
             connection.write(response);
             break;
           }
@@ -150,7 +230,8 @@ const server = net.createServer((connection) => {
       },
 
       returnError: (err) => {
-        console.error(" Parser Error:", err);
+        console.error("Parser Error:", err);
+        connection.write("-ERR Protocol error\r\n");
       },
     });
 
@@ -158,8 +239,9 @@ const server = net.createServer((connection) => {
   });
 
   connection.on("end", () => console.log("Client disconnected"));
+  connection.on("error", (err) => console.error("Connection error:", err));
 });
 
 server.listen(6379, () =>
-  console.log(" Custom Redis Server running on port 6379")
+  console.log("Custom Redis Server running on port 6379")
 );
