@@ -215,14 +215,20 @@ const server = net.createServer((connection) => {
             break;
           }
 
-          // FLUSHALL
+          // ============================
+          // FLUSHALL feature added by Pratik
+          // Description: This command clears all keys and expiry times across all databases.
+          // Each step below is explained for clarity.
+          // ============================
           case "flushall": {
-            store = {};
-            expiryTimes = {};
+            store = {};   // Clear all keys from the in-memory data store
+            expiryTimes = {};   // Remove all expiry times associated with the cleared keys
             saveToFile();
             connection.write("+OK\r\n");
             break;
           }
+
+          // Handle any unknown or unsupported commands
 
           default:
             connection.write(`-ERR unknown command '${command}'\r\n`);
